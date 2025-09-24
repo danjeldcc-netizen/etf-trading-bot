@@ -1,0 +1,204 @@
+import os
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import smtplib
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+from datetime import datetime
+
+# Konfiguracija iz environment variables
+SYMBOLS = ['XLI', 'XLK', 'XLY', 'XLP', 'XLF', 'XLV', 'XLC', 'XLE', 'XLB', 'SPY', 'QQQ', 'SLV', 'GLD']
+
+EMAIL_CONFIG = {
+    'email': os.getenv('EMAIL'),
+    'password': os.getenv('EMAIL_PASSWORD'),
+    'smtp_server': 'smtp.gmail.com',
+    'smtp_port': 587
+}
+
+class ETFSuperTrendBot:
+    def __init__(self):
+        self.atr_length = 10
+        self.factor = 3.0
+        
+    def calculate_atr(self, high, low, close, period):
+        """Izračunaj Average True Range"""
+        high_low = high - low
+        high_close_prev = abs(high - close.shift(1))
+        low_close_prev = abs(low - close.shift(1))
+        
+        true_range = pd.DataFrame({
+            'hl': high_low,
+            'hc': high_close_prev,
+            'lc': low_close_prev
+        }).max(axis=1)
+        
+        return true_range.rolling(window=period).mean()
+    
+    def calculate_supertrend(self, df):
+        """Implementacija SuperTrend indikatorja"""
+        high = df['High']
+        low = df['Low'] 
+        close = df['Close']
+        
+        # Izračun ATR
+        atr = self.calculate_atr(high, low, close, self.atr_length)
+        
+        # Osnovni izračuni
+        hl2 = (high + low) / 2
+        upper_band = hl2 + (self.factor * atr)
+        lower_band = hl2 - (self.factor * atr)
+        
+        # Inicializacija
+        supertrend = [np.nan] * len(close)
+        direction = [0] * len(close)
+        
+        # Prvi signal
+        if len(close) > self.atr_length:
+            supertrend[self.atr_length] = upper_band.iloc[self.atr_length]
+            direction[self.atr_length] = 1
+        
+        # Glavna zanka za izračun
+        for i in range(self.atr_length + 1, len(close)):
+            current_upper = upper_band.iloc[i]
+            current_lower = lower_band.iloc[i]
+            current_close = close.iloc[i]
+            
+            prev_upper = upper_band.iloc[i-1]
+            prev_lower = lower_band.iloc[i-1]
+            prev_close = close.iloc[i-1]
+            prev_direction = direction[i-1]
+            
+            # Prilagoditev bandov
+            if current_lower > prev_lower or prev_close < prev_lower:
+                final_lower = current_lower
+            else:
+                final_lower = prev_lower
+                
+            if current_upper < prev_upper or prev_close > prev_upper:
+                final_upper = current_upper
+            else:
+                final_upper = prev_upper
+            
+            # Določitev smeri
+            if prev_direction == 1:
+                current_direction = 1 if current_close > final_upper else -1
+            else:
+                current_direction = -1 if current_close < final_lower else 1
+            
+            # Določitev SuperTrend vrednosti
+            if current_direction == 1:
+                supertrend[i] = final_lower
+            else:
+                supertrend[i] = final_upper
+                
+            direction[i] = current_direction
+        
+        return supertrend, direction
+    
+    def get_historical_data(self, symbol):
+        """Pridobi zgodovinske podatke za simbol"""
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period='3mo', interval='1d')
+            
+            if data.empty:
+                print(f"⚠️  Ni podatkov za {symbol}")
+                return None
+                
+            return data
+        except Exception as e:
+            print(f"❌ Napaka pri pridobivanju podatkov za {symbol}: {e}")
+            return None
+    
+    def check_buy_signal(self, symbol):
+        """Preveri buy signal za simbol"""
+        print(f"🔍 Analiziram {symbol}...")
+        
+        data = self.get_historical_data(symbol)
+        if data is None or len(data) < self.atr_length + 2:
+            return False, None, None
+        
+        # Izračunaj SuperTrend
+        supertrend, direction = self.calculate_supertrend(data)
+        
+        # Preveri za buy signal (sprememba iz -1 v 1)
+        if len(direction) >= 2:
+            current_dir = direction[-1]
+            prev_dir = direction[-2]
+            current_price = data['Close'].iloc[-1]
+            timestamp = data.index[-1]
+            
+            if prev_dir == -1 and current_dir == 1:
+                print(f"🎯 BUY SIGNAL za {symbol}!")
+                return True, current_price, timestamp
+        
+        return False, None, None
+    
+    def send_email_alert(self, symbol, price, timestamp):
+        """Pošlji email obvestilo"""
+        try:
+            msg = MimeMultipart()
+            msg['Subject'] = f"🚀 ETF BUY SIGNAL: {symbol}"
+            msg['From'] = EMAIL_CONFIG['email']
+            msg['To'] = EMAIL_CONFIG['email']
+            
+            body = f"""
+            ETF Trading Alert - SuperTrend Buy Signal
+            
+            Signal Details:
+            - ETF: {symbol}
+            - Price: ${price:.2f}
+            - Time: {timestamp.strftime('%Y-%m-%d %H:%M')}
+            - Indicator: Machine Learning Adaptive SuperTrend
+            - Timeframe: Daily
+            
+            Monitored ETFs: {', '.join(SYMBOLS)}
+            
+            This is an automated alert generated by ETF SuperTrend Bot.
+            Always conduct your own research before trading.
+            """
+            
+            msg.attach(MimeText(body, 'plain'))
+            
+            server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+            server.starttls()
+            server.login(EMAIL_CONFIG['email'], EMAIL_CONFIG['password'])
+            server.send_message(msg)
+            server.quit()
+            
+            print(f"✅ Email poslan za {symbol}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Napaka pri pošiljanju emaila za {symbol}: {e}")
+            return False
+    
+    def run_check(self):
+        """Glavna funkcija za preverjanje vseh ETF-jev"""
+        print(f"=== ETF SuperTrend Check {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+        print(f"🔍 Preverjam {len(SYMBOLS)} ETF-jev...")
+        
+        signals_detected = 0
+        
+        for symbol in SYMBOLS:
+            try:
+                has_signal, price, timestamp = self.check_buy_signal(symbol)
+                
+                if has_signal:
+                    self.send_email_alert(symbol, price, timestamp)
+                    signals_detected += 1
+                else:
+                    print(f"➖ Ni signala za {symbol}")
+                    
+            except Exception as e:
+                print(f"❌ Napaka pri {symbol}: {e}")
+                continue
+        
+        print(f"📊 Skupaj zaznanih signalov: {signals_detected}")
+        print("✅ Preverjanje končano\n")
+
+if __name__ == "__main__":
+    bot = ETFSuperTrendBot()
+    bot.run_check()
